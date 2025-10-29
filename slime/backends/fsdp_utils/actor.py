@@ -100,6 +100,14 @@ class FSDPTrainRayActor(TrainRayActor):
         if args.gradient_checkpointing:
             model.gradient_checkpointing_enable()
 
+        # Apply LoRA before FSDP wrapping if enabled
+        if getattr(args, 'use_lora', False):
+            print("\n" + "="*80)
+            print("Applying LoRA to model before FSDP wrapping...")
+            print("="*80)
+            from slime_plugins.lora.fsdp_lora_hook import apply_lora_to_fsdp_model
+            model = apply_lora_to_fsdp_model(model, args)
+
         # Create FSDP v2 model using FSDP
         self.model = FSDP(model)
 

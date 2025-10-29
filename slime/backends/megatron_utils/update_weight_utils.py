@@ -123,11 +123,13 @@ def all_gather_params_async(
             assert partition_dim is not None, "partition_stride != 1 is not supported"
             # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
             # TODO: check only GLU is used.
-            if "linear_fc1.weight" in info.name:
+            # Strip .base_layer for LoRA compatibility in pattern matching
+            clean_name = info.name.replace('.base_layer.', '.')
+            if "linear_fc1.weight" in clean_name:
                 param_partitions = [p.chunk(2, dim=0) for p in param_partitions]
                 param_partitions = [p[0] for p in param_partitions] + [p[1] for p in param_partitions]
             # this is bug in megatron's grouped moe.
-            if "linear_fc2.weight" in info.name:
+            if "linear_fc2.weight" in clean_name:
                 if partition_dim == 0:
                     partition_dim = 1
             param = torch.cat(param_partitions, dim=partition_dim)
@@ -487,6 +489,12 @@ class UpdateWeightFromTensor:
         for info, param in zip(param_infos, params):
             for key, value in info.attrs.items():
                 setattr(param, key, value)
+            
+            # Debug: check if TP attrs are set correctly for base_layer weights
+            if '.base_layer.weight' in info.name and dist.get_rank() == 0:
+                tp_enabled = getattr(param, 'tensor_model_parallel', False)
+                partition_dim = getattr(param, 'partition_dim', -1)
+                print(f"[DEBUG] Before gather - {info.name}: shape={param.shape}, tp={tp_enabled}, partition_dim={partition_dim}")
 
         # Batch async all_gather for all parameters
         gathered_params = all_gather_params_async(list(zip(param_infos, params)))
@@ -498,10 +506,79 @@ class UpdateWeightFromTensor:
     ) -> list[ObjectRef]:
 
         converted_named_tensors = []
+        
+        # Build a mapping of base_layer weights to their LoRA components
+        lora_mapping = {}  # {base_layer_name: {'lora_A': tensor, 'lora_B': tensor, 'lora_A_info': ParamInfo, 'lora_B_info': ParamInfo}}
+        
+        # First pass: collect LoRA parameters (note: these are already gathered to full size by all_gather_params_async)
+        for info, param in zip(param_infos, gathered_params):
+            param_name = info.name
+            
+            if '.lora_A' in param_name:
+                base_name = param_name.replace('.lora_A', '.base_layer.weight')
+                if base_name not in lora_mapping:
+                    lora_mapping[base_name] = {}
+                lora_mapping[base_name]['lora_A'] = param
+                lora_mapping[base_name]['lora_A_info'] = info
+                # Debug: check TP attributes
+                if dist.get_rank() == 0:
+                    tp_enabled = info.attrs.get('tensor_model_parallel', False)
+                    partition_dim = info.attrs.get('partition_dim', -1)
+                    print(f"[DEBUG] lora_A {param_name}: shape={param.shape}, tp={tp_enabled}, partition_dim={partition_dim}")
+            elif '.lora_B' in param_name:
+                base_name = param_name.replace('.lora_B', '.base_layer.weight')
+                if base_name not in lora_mapping:
+                    lora_mapping[base_name] = {}
+                lora_mapping[base_name]['lora_B'] = param
+                lora_mapping[base_name]['lora_B_info'] = info
+                # Debug: check TP attributes
+                if dist.get_rank() == 0:
+                    tp_enabled = info.attrs.get('tensor_model_parallel', False)
+                    partition_dim = info.attrs.get('partition_dim', -1)
+                    print(f"[DEBUG] lora_B {param_name}: shape={param.shape}, tp={tp_enabled}, partition_dim={partition_dim}")
+        
+        # Second pass: merge LoRA into base weights and convert
         for info, param in zip(param_infos, gathered_params):
             param = remove_padding(info.name, param, self.vocab_size)
+            param_name = info.name.replace('.base_layer.', '.')
+            
+            # Skip LoRA parameters - they're merged into base weights
+            if '.lora_A' in info.name or '.lora_B' in info.name:
+                continue
+            
+            # If this is a base_layer weight with LoRA, merge them
+            if info.name in lora_mapping:
+                lora_components = lora_mapping[info.name]
+                if 'lora_A' in lora_components and 'lora_B' in lora_components:
+                    lora_A = lora_components['lora_A']
+                    lora_B = lora_components['lora_B']
+                    
+                    # Debug: check shapes before merge
+                    if dist.get_rank() == 0:
+                        print(f"[DEBUG] Merging LoRA for {param_name}:")
+                        print(f"  base_layer shape: {param.shape}")
+                        print(f"  lora_A shape: {lora_A.shape}")
+                        print(f"  lora_B shape: {lora_B.shape}")
+                    
+                    # Get LoRA config from args
+                    lora_r = getattr(self.args, 'lora_r', 16)
+                    lora_alpha = getattr(self.args, 'lora_alpha', 32.0)
+                    scaling = lora_alpha / lora_r
+                    
+                    # Merge: W_merged = W_base + (lora_B @ lora_A) * scaling
+                    # Both param and lora_A/lora_B should be gathered to full size
+                    delta_w = (lora_B @ lora_A) * scaling
+                    
+                    if dist.get_rank() == 0:
+                        print(f"  delta_w shape: {delta_w.shape}")
+                    
+                    param = param + delta_w
+                    
+                    if dist.get_rank() == 0:
+                        print(f"✓ Merged LoRA into {param_name} (delta_norm: {delta_w.norm():.4f})")
+            
             converted_named_tensors.extend(
-                convert_to_hf(self.args, self.model_name, info.name, param, self.quantization_config)
+                convert_to_hf(self.args, self.model_name, param_name, param, self.quantization_config)
             )
 
         all_refs = []

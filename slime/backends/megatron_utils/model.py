@@ -661,6 +661,23 @@ def initialize_model_and_optimizer(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     setattr(model[0], "role", role)
     clear_memory()
+    
+    # Apply LoRA if enabled (before loading checkpoint)
+    if getattr(args, 'use_lora', False):
+        try:
+            from slime_plugins.lora.megatron_lora_hook import apply_lora_to_megatron_model
+            print("=" * 80)
+            print("Original model:")
+            print(model)
+            print("=" * 80)
+            print("🔧 Applying LoRA to model...")
+            print("=" * 80)
+            model = apply_lora_to_megatron_model(model, args)
+        except ImportError as e:
+            print(f"⚠️  Failed to import LoRA plugin: {e}")
+            print("⚠️  Please ensure slime_plugins/lora is properly installed.")
+            raise
+    
     iteration, _ = load_checkpoint(
         model,
         optimizer,

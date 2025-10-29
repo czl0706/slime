@@ -1048,6 +1048,58 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_lora_arguments(parser):
+            """Add LoRA (Low-Rank Adaptation) arguments for parameter-efficient fine-tuning."""
+            parser.add_argument(
+                "--use-lora",
+                action="store_true",
+                default=False,
+                help="Enable LoRA (Low-Rank Adaptation) for parameter-efficient fine-tuning.",
+            )
+            parser.add_argument(
+                "--lora-r",
+                type=int,
+                default=8,
+                help="LoRA rank (r). Typical values: 4, 8, 16, 32. Higher rank = more parameters.",
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=float,
+                default=16.0,
+                help="LoRA alpha scaling parameter. Common practice: alpha = 2 * r.",
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="Dropout probability for LoRA layers. 0.0 means no dropout.",
+            )
+            parser.add_argument(
+                "--lora-target-modules",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "List of module names to apply LoRA. "
+                    "For Megatron: linear_qkv, linear_proj, linear_fc1, linear_fc2. "
+                    "For HuggingFace: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj. "
+                    "Leave empty to use defaults."
+                ),
+            )
+            parser.add_argument(
+                "--lora-only-trainable",
+                action="store_true",
+                default=True,
+                help="Only train LoRA parameters, freeze all other parameters.",
+            )
+            parser.add_argument(
+                "--lora-merge-weights",
+                action="store_true",
+                default=False,
+                help="Merge LoRA weights into base model for inference (faster but no longer adaptable).",
+            )
+            return parser
+
         def add_sglang_tp_size():
             temp_parser = argparse.ArgumentParser(add_help=False)
             temp_parser.add_argument("--rollout-num-gpus-per-engine", type=int, default=1)
@@ -1074,6 +1126,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
+        parser = add_lora_arguments(parser)
         parser = add_ci_arguments(parser)
         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
 
